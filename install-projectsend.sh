@@ -87,7 +87,7 @@ export NEEDRESTART_SUSPEND=1
 apt-get update -y
 apt-get install -y --no-install-recommends \
     ca-certificates curl wget gnupg2 lsb-release apt-transport-https \
-    software-properties-common unzip git
+    unzip git
 
 # ---------------------------------------------------------------------------
 # 2. PHP - ProjectSend r2029+ requires PHP 8.2 or newer.
