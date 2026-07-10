@@ -51,12 +51,12 @@ DB_PASS="${DB_PASS:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)}"
 APACHE_PORT="${APACHE_PORT:-80}"
 CREDS_FILE="/root/projectsend_credentials.txt"
 
-# Try to guess the public IP for the vhost / final instructions if not given
+# Guess a local IP for the vhost / final instructions if not given.
+# Deliberately avoided calling out to an external "what's my IP" service
+# here - if DNS/networking on the host doesn't respond cleanly, that kind
+# of call can hang well past its timeout and stall the whole script.
 if [[ -z "${SITE_DOMAIN:-}" ]]; then
-    SITE_DOMAIN="$(curl -s -4 --max-time 5 https://ifconfig.me || true)"
-    if [[ -z "${SITE_DOMAIN}" ]]; then
-        SITE_DOMAIN="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    fi
+    SITE_DOMAIN="$(hostname -I 2>/dev/null | awk '{print $1}')"
     if [[ -z "${SITE_DOMAIN}" ]]; then
         SITE_DOMAIN="_"
     fi
@@ -73,6 +73,13 @@ echo "=================================================================="
 # 1. Base packages
 # ---------------------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
+# Debian 12+ ships "needrestart", which pops up an interactive whiptail
+# dialog asking which services to restart after installing packages like
+# apache2/mariadb-server/php. That dialog can silently hang a piped
+# `curl | sudo bash` session with no visible output. Force it to run
+# non-interactively instead.
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
 apt-get update -y
 apt-get install -y --no-install-recommends \
     ca-certificates curl wget gnupg2 lsb-release apt-transport-https \
