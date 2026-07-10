@@ -47,7 +47,11 @@ fi
 APP_DIR="${APP_DIR:-/var/www/projectsend}"
 DB_NAME="${DB_NAME:-projectsend}"
 DB_USER="${DB_USER:-projectsend}"
-DB_PASS="${DB_PASS:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)}"
+# Note: password generation reads a *finite* chunk of /dev/urandom first.
+# The classic `tr </dev/urandom | head` pattern causes tr to be killed with
+# SIGPIPE when head exits, and with `set -o pipefail` that aborts the whole
+# script with exit code 141 and no error message.
+DB_PASS="${DB_PASS:-$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)}"
 APACHE_PORT="${APACHE_PORT:-80}"
 CREDS_FILE="/root/projectsend_credentials.txt"
 
