@@ -31,6 +31,11 @@
 #
 set -euo pipefail
 
+# Make sure sbin dirs are on PATH. If root was obtained via plain `su`
+# (without `-`), the inherited PATH lacks /usr/sbin, which breaks
+# a2enmod/a2ensite/a2dissite.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
 # ---------------------------------------------------------------------------
 # 0. Pre-flight checks
 # ---------------------------------------------------------------------------
