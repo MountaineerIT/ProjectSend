@@ -4,9 +4,9 @@
 #
 # Unattended installer for ProjectSend (https://www.projectsend.org / docs: https://docs.projectsend.org)
 # on Debian. Installs a full LAMP stack (Apache + MariaDB + PHP), creates the
-# database/user, downloads the latest ProjectSend release from GitHub, builds
-# its composer dependencies, writes sys.config.php, configures Apache, and
-# sets permissions.
+# database/user, downloads the latest official ProjectSend release package
+# (with compiled assets and vendor libraries included), writes sys.config.php,
+# configures Apache, and sets permissions.
 #
 # Tested target: Debian 11/12/13 (bullseye/bookworm/trixie), run as root.
 #
@@ -57,6 +57,14 @@ DB_USER="${DB_USER:-projectsend}"
 # SIGPIPE when head exits, and with `set -o pipefail` that aborts the whole
 # script with exit code 141 and no error message.
 DB_PASS="${DB_PASS:-$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)}"
+
+# A user-supplied DB_PASS goes into both a sed replacement and a SQL heredoc,
+# so restrict it to characters that are safe in both contexts.
+if [[ ! "${DB_PASS}" =~ ^[A-Za-z0-9_.@#%^+=-]+$ ]]; then
+    echo "DB_PASS contains unsupported characters." >&2
+    echo "Allowed: letters, digits, and _ . @ # % ^ + = -" >&2
+    exit 1
+fi
 APACHE_PORT="${APACHE_PORT:-80}"
 CREDS_FILE="/root/projectsend_credentials.txt"
 
@@ -101,11 +109,6 @@ apt-get install -y --no-install-recommends \
 #    distro's own PHP is below 8.2.
 # ---------------------------------------------------------------------------
 NEED_SURY=0
-if command -v php >/dev/null 2>&1; then
-    CURRENT_PHP_VER="$(php -r 'echo PHP_VERSION;' 2>/dev/null || echo 0)"
-else
-    CURRENT_PHP_VER=0
-fi
 DEFAULT_PHP_CANDIDATE="$(apt-cache madison php 2>/dev/null | head -1 | awk '{print $3}' | cut -d: -f2 | cut -d- -f1 || true)"
 
 php_ver_ge_82() {
@@ -187,29 +190,48 @@ systemctl enable --now mariadb
 mysql --protocol=socket -u root <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8 COLLATE utf8_general_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+-- Always (re)set the password so re-runs keep MariaDB in sync with the
+-- freshly written sys.config.php even if the user already existed.
+ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 
 # ---------------------------------------------------------------------------
-# 5. Download the latest ProjectSend release from GitHub
+# 5. Download the latest ProjectSend release from GitHub.
+#    IMPORTANT: use the built release asset (projectsend-rXXXX.zip), NOT the
+#    source code archive. The source archive lacks the compiled CSS/JS assets
+#    and the composer vendor/ folder, resulting in an unstyled, broken UI.
 # ---------------------------------------------------------------------------
-echo ">>> Looking up the latest ProjectSend release tag..."
-LATEST_TAG="$(curl -fsSL https://api.github.com/repos/projectsend/projectsend/releases/latest | \
-    grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')"
+echo ">>> Looking up the latest ProjectSend release..."
+RELEASE_JSON="$(curl -fsSL https://api.github.com/repos/projectsend/projectsend/releases/latest)"
+LATEST_TAG="$(echo "${RELEASE_JSON}" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')"
+ZIP_URL="$(echo "${RELEASE_JSON}" | grep -m1 '"browser_download_url"' | sed -E 's/.*"browser_download_url":\s*"([^"]+)".*/\1/')"
 
-if [[ -z "${LATEST_TAG}" ]]; then
-    echo "Could not determine the latest ProjectSend release tag; aborting." >&2
+if [[ -z "${LATEST_TAG}" || -z "${ZIP_URL}" ]]; then
+    echo "Could not determine the latest ProjectSend release; aborting." >&2
     exit 1
 fi
-echo ">>> Latest release: ${LATEST_TAG}"
+echo ">>> Latest release: ${LATEST_TAG} (${ZIP_URL})"
 
 WORK_DIR="$(mktemp -d)"
-curl -fsSL "https://codeload.github.com/projectsend/projectsend/zip/refs/tags/${LATEST_TAG}" \
-    -o "${WORK_DIR}/projectsend.zip"
-unzip -q "${WORK_DIR}/projectsend.zip" -d "${WORK_DIR}"
+curl -fsSL "${ZIP_URL}" -o "${WORK_DIR}/projectsend.zip"
+# The built release zip extracts flat (files at the zip root, no wrapper
+# directory), so extract directly into a staging folder.
+mkdir -p "${WORK_DIR}/app"
+unzip -q "${WORK_DIR}/projectsend.zip" -d "${WORK_DIR}/app"
 
-EXTRACTED_DIR="$(find "${WORK_DIR}" -maxdepth 1 -type d -name 'projectsend-*')"
+# Support both layouts just in case: flat, or a single wrapper directory.
+if [[ -f "${WORK_DIR}/app/index.php" ]]; then
+    EXTRACTED_DIR="${WORK_DIR}/app"
+else
+    EXTRACTED_DIR="$(find "${WORK_DIR}/app" -maxdepth 1 -mindepth 1 -type d | head -1)"
+fi
+
+if [[ -z "${EXTRACTED_DIR}" || ! -f "${EXTRACTED_DIR}/index.php" ]]; then
+    echo "Extracted ProjectSend archive doesn't look right; aborting." >&2
+    exit 1
+fi
 
 mkdir -p "$(dirname "${APP_DIR}")"
 if [[ -d "${APP_DIR}" ]]; then
@@ -219,15 +241,11 @@ fi
 mv "${EXTRACTED_DIR}" "${APP_DIR}"
 rm -rf "${WORK_DIR}"
 
-# ---------------------------------------------------------------------------
-# 6. Install PHP (composer) dependencies - the GitHub source archive does
-#    not ship the vendor/ folder that ProjectSend's autoloader needs.
-# ---------------------------------------------------------------------------
-echo ">>> Installing PHP dependencies with Composer (this can take a minute)..."
-( cd "${APP_DIR}" && composer install --no-dev --optimize-autoloader --no-interaction )
+# The built release ships its vendor/ folder, so no composer install is
+# required. Keep composer available anyway for future maintenance.
 
 # ---------------------------------------------------------------------------
-# 7. Write sys.config.php with the database credentials
+# 6. Write sys.config.php with the database credentials
 # ---------------------------------------------------------------------------
 CONFIG_FILE="${APP_DIR}/includes/sys.config.php"
 cp "${APP_DIR}/includes/sys.config.sample.php" "${CONFIG_FILE}"
@@ -239,14 +257,14 @@ sed -i \
     "${CONFIG_FILE}"
 
 # ---------------------------------------------------------------------------
-# 8. Ownership and permissions (per ProjectSend docs: dirs 775, files 644)
+# 7. Ownership and permissions (per ProjectSend docs: dirs 775, files 644)
 # ---------------------------------------------------------------------------
 chown -R www-data:www-data "${APP_DIR}"
 find "${APP_DIR}" -type d -exec chmod 775 {} \;
 find "${APP_DIR}" -type f -exec chmod 644 {} \;
 
 # ---------------------------------------------------------------------------
-# 9. Apache vhost
+# 8. Apache vhost
 # ---------------------------------------------------------------------------
 a2enmod rewrite >/dev/null
 
@@ -285,14 +303,14 @@ systemctl enable --now apache2
 systemctl restart apache2
 
 # ---------------------------------------------------------------------------
-# 10. Firewall (only if ufw is installed and active)
+# 9. Firewall (only if ufw is installed and active)
 # ---------------------------------------------------------------------------
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
     ufw allow "${APACHE_PORT}/tcp" || true
 fi
 
 # ---------------------------------------------------------------------------
-# 11. Save credentials and print summary
+# 10. Save credentials and print summary
 # ---------------------------------------------------------------------------
 cat > "${CREDS_FILE}" <<EOF
 ProjectSend installation summary
