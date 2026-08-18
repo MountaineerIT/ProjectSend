@@ -22,6 +22,10 @@
 # This build assumes a reverse proxy (BunkerWeb) terminates TLS in front of
 # this host. Consequences, all handled below:
 #   * No certbot here. nginx listens on plain HTTP on the private interface.
+#   * fastcgi_param HTTPS on is set when APP_URL is https://, so PHP knows the
+#     original scheme. Without it Laravel builds http:// asset URLs on an
+#     https:// page, the browser blocks them all as mixed content, and you get
+#     a blank white page with a healthy 200 and nothing in any log.
 #   * TRUSTED_PROXIES is set, without which every visitor looks like the proxy:
 #     the login rate limiter treats all users as one attacker and locks the
 #     whole site out after five bad passwords, and the download log records
@@ -491,6 +495,21 @@ FPM_SOCK="/run/php/php${PHP_VER}-fpm.sock"
 NGINX_SITE="/etc/nginx/sites-available/projectsend.conf"
 SERVER_NAME="$(printf '%s' "${APP_URL}" | sed -E 's#^https?://##; s#[:/].*$##')"
 
+# The proxy terminates TLS and forwards plain HTTP to this host, so PHP would
+# otherwise believe the request was insecure and Laravel would build every
+# asset URL as http:// on an https:// page. The browser blocks all of them as
+# mixed content, Vue never mounts, and you get a blank white page with a
+# healthy HTTP 200 and nothing in any log. Telling PHP the original scheme
+# fixes it at the source - and unlike relying on X-Forwarded-Proto, it does
+# not depend on the proxy forwarding anything or on TRUSTED_PROXIES matching
+# the address the proxy happens to connect from.
+if [[ "${APP_URL}" == https://* ]]; then
+    HTTPS_PARAM="        fastcgi_param HTTPS on;
+"
+else
+    HTTPS_PARAM=""
+fi
+
 cat > "${NGINX_SITE}" <<NGINXCONF
 server {
     listen ${LISTEN_ADDR}:${LISTEN_PORT};
@@ -536,7 +555,7 @@ server {
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
         include fastcgi_params;
-        fastcgi_buffer_size 32k;
+${HTTPS_PARAM}        fastcgi_buffer_size 32k;
         fastcgi_buffers 8 32k;
     }
 
